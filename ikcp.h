@@ -282,6 +282,13 @@ struct IKCPSEG
 	char data[1];
 };
 
+enum IKCPSTATE {
+    KCP_SYN_INIT,
+    KCP_SYN_SENT,
+    KCP_SYN_RCV,
+    KCP_ESTABLISHED,
+    KCP_FIN,
+};
 
 //---------------------------------------------------------------------
 // IKCPCB
@@ -313,6 +320,8 @@ struct IKCPCB
 	int nocwnd, stream;
 	int logmask;
 	int (*output)(const char *buf, int len, struct IKCPCB *kcp, void *user);
+    int (*connected)(struct IKCPCB *kcp, void *user);
+    void (*timeout)(struct IKCPCB *kcp, void *user);
 	void (*writelog)(const char *log, struct IKCPCB *kcp, void *user);
 };
 
@@ -351,6 +360,12 @@ void ikcp_release(ikcpcb *kcp);
 // set output callback, which will be invoked by kcp
 void ikcp_setoutput(ikcpcb *kcp, int (*output)(const char *buf, int len, 
 	ikcpcb *kcp, void *user));
+
+// set connected callback, which will be invoked by kcp
+void ikcp_setconnected(ikcpcb *kcp, int (*connected)(ikcpcb *kcp, void *user));
+
+// client connect
+int ikcp_connect(ikcpcb *kcp);
 
 // user/upper level recv: returns size, returns below zero for EAGAIN
 int ikcp_recv(ikcpcb *kcp, char *buffer, int len);
@@ -406,6 +421,7 @@ void ikcp_allocator(void* (*new_malloc)(size_t), void (*new_free)(void*));
 // read conv
 IUINT32 ikcp_getconv(const void *ptr);
 
+int ikcp_syn_cmd(IUINT32 cmd);
 
 #ifdef __cplusplus
 }

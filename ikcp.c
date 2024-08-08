@@ -30,6 +30,7 @@ const IUINT32 IKCP_CMD_PUSH = 81;		// cmd: push data
 const IUINT32 IKCP_CMD_ACK  = 82;		// cmd: ack
 const IUINT32 IKCP_CMD_WASK = 83;		// cmd: window probe (ask)
 const IUINT32 IKCP_CMD_WINS = 84;		// cmd: window size (tell)
+const IUINT32 IKCP_CMD_SYN  = 85;		// cmd: syn (tell)
 const IUINT32 IKCP_ASK_SEND = 1;		// need to send IKCP_CMD_WASK
 const IUINT32 IKCP_ASK_TELL = 2;		// need to send IKCP_CMD_WINS
 const IUINT32 IKCP_WND_SND = 32;
@@ -268,7 +269,7 @@ ikcpcb* ikcp_create(IUINT32 conv, void *user)
 	kcp->nsnd_buf = 0;
 	kcp->nrcv_que = 0;
 	kcp->nsnd_que = 0;
-	kcp->state = 0;
+	kcp->state = KCP_SYN_INIT;
 	kcp->acklist = NULL;
 	kcp->ackblock = 0;
 	kcp->ackcount = 0;
@@ -289,11 +290,40 @@ ikcpcb* ikcp_create(IUINT32 conv, void *user)
 	kcp->xmit = 0;
 	kcp->dead_link = IKCP_DEADLINK;
 	kcp->output = NULL;
+    kcp->connected = NULL;
+    kcp->timeout = NULL;
 	kcp->writelog = NULL;
 
 	return kcp;
 }
 
+void ikcp_setconnected(ikcpcb *kcp, int (*connected)(ikcpcb *kcp, void *user))
+{
+    kcp->connected = connected;
+}
+
+int ikcp_connect(ikcpcb *kcp)
+{
+    if (kcp->state != KCP_SYN_INIT) {
+        return -1;
+    }
+
+    IKCPSEG* seg = ikcp_segment_new(kcp, 0);
+    if (seg == NULL) {
+        return -2;
+    }
+
+    seg->len = 0;
+    seg->frg = 0;
+    seg->cmd = IKCP_CMD_SYN;
+    iqueue_init(&seg->node);
+    iqueue_add_tail(&seg->node, &kcp->snd_queue);
+    kcp->nsnd_que++;
+    // CLIENT: syn sent
+    kcp->state = KCP_SYN_SENT;
+
+    return 0;
+}
 
 //---------------------------------------------------------------------
 // release a new kcpcb
@@ -395,7 +425,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 		fragment = seg->frg;
 
 		if (ikcp_canlog(kcp, IKCP_LOG_RECV)) {
-			ikcp_log(kcp, IKCP_LOG_RECV, "recv sn=%lu", (unsigned long)seg->sn);
+            ikcp_log(kcp, IKCP_LOG_RECV, "kcp recv sn=%lu len=%lu ts=%lu", (unsigned long)seg->sn, seg->len, seg->ts);
 		}
 
 		if (ispeek == 0) {
@@ -479,7 +509,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 	if (kcp->stream != 0) {
 		if (!iqueue_is_empty(&kcp->snd_queue)) {
 			IKCPSEG *old = iqueue_entry(kcp->snd_queue.prev, IKCPSEG, node);
-			if (old->len < kcp->mss) {
+			if (old->len < kcp->mss && old->cmd == IKCP_CMD_PUSH) {
 				int capacity = kcp->mss - old->len;
 				int extend = (len < capacity)? len : capacity;
 				seg = ikcp_segment_new(kcp, old->len + extend);
@@ -487,6 +517,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 				if (seg == NULL) {
 					return -2;
 				}
+                seg->cmd = IKCP_CMD_PUSH;
 				iqueue_add_tail(&seg->node, &kcp->snd_queue);
 				memcpy(seg->data, old->data, old->len);
 				if (buffer) {
@@ -528,6 +559,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 		if (buffer && len > 0) {
 			memcpy(seg->data, buffer, size);
 		}
+        seg->cmd = IKCP_CMD_PUSH;
 		seg->len = size;
 		seg->frg = (kcp->stream == 0)? (count - i - 1) : 0;
 		iqueue_init(&seg->node);
@@ -589,6 +621,14 @@ static void ikcp_parse_ack(ikcpcb *kcp, IUINT32 sn)
 			iqueue_del(p);
 			ikcp_segment_delete(kcp, seg);
 			kcp->nsnd_buf--;
+
+            // CLIENT: syn ack rcv
+            if (kcp->state == KCP_SYN_SENT) {
+                kcp->state = KCP_ESTABLISHED;
+                if (kcp->connected) {
+                    kcp->connected(kcp, kcp->user);
+                }
+            }
 			break;
 		}
 		if (_itimediff(sn, seg->sn) < 0) {
@@ -789,8 +829,10 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		if ((long)size < (long)len || (int)len < 0) return -2;
 
 		if (cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK &&
-			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS) 
-			return -3;
+			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS && cmd != IKCP_CMD_SYN) {
+            ikcp_log(kcp, IKCP_LOG_INPUT, "cmd unknown %d", cmd);
+            return -3;
+        }
 
 		kcp->rmt_wnd = wnd;
 		ikcp_parse_una(kcp, una);
@@ -826,11 +868,28 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 					(long)kcp->rx_rto);
 			}
 		}
+        else if (cmd == IKCP_CMD_SYN) {  // SEVER: syn rcv
+            ikcp_log(kcp, IKCP_LOG_IN_DATA, "input syn: sn=%lu ts=%lu len=%lu sn=%lu", (unsigned long)sn, (unsigned long)ts, len, sn);
+
+            if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) {
+                ikcp_ack_push(kcp, sn, ts);
+                if (kcp->state == KCP_SYN_INIT) {
+                    kcp->state = KCP_ESTABLISHED;  // TODO: from sync_recv->establish
+                    kcp->rcv_nxt++;
+                }
+            }
+        }
 		else if (cmd == IKCP_CMD_PUSH) {
 			if (ikcp_canlog(kcp, IKCP_LOG_IN_DATA)) {
 				ikcp_log(kcp, IKCP_LOG_IN_DATA, 
 					"input psh: sn=%lu ts=%lu", (unsigned long)sn, (unsigned long)ts);
 			}
+
+            if (kcp->state == KCP_SYN_INIT) {
+                ikcp_log(kcp, IKCP_LOG_IN_DATA, "no-syn: sn=%lu ts=%lu", (unsigned long)sn, (unsigned long)ts);
+                return -4;
+            }
+
 			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) {
 				ikcp_ack_push(kcp, sn, ts);
 				if (_itimediff(sn, kcp->rcv_nxt) >= 0) {
@@ -1037,7 +1096,11 @@ void ikcp_flush(ikcpcb *kcp)
 		kcp->nsnd_buf++;
 
 		newseg->conv = kcp->conv;
-		newseg->cmd = IKCP_CMD_PUSH;
+
+        if (newseg->cmd != IKCP_CMD_PUSH) {
+            ikcp_log(kcp, IKCP_LOG_OUTPUT, "kcp cmd %d", newseg->cmd);
+        }
+
 		newseg->wnd = seg.wnd;
 		newseg->ts = current;
 		newseg->sn = kcp->snd_nxt++;
@@ -1303,4 +1366,7 @@ IUINT32 ikcp_getconv(const void *ptr)
 	return conv;
 }
 
-
+int ikcp_syn_cmd(IUINT32 cmd)
+{
+    return cmd == IKCP_CMD_SYN;
+}

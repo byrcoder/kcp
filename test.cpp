@@ -26,6 +26,22 @@ int udp_output(const char *buf, int len, ikcpcb *kcp, void *user)
 	return 0;
 }
 
+// 模拟网络：模拟发送一个 udp包
+int udp_connect(ikcpcb *kcp, void *user)
+{
+    union { int id; void *ptr; } parameter;
+    parameter.ptr = user;
+    printf("kcp connected %d\n", parameter.id);
+    return 0;
+}
+
+void writelog(const char *log, struct IKCPCB *kcp, void *user)
+{
+    union { int id; void *ptr; } parameter;
+    parameter.ptr = user;
+    printf("%d. %s\n", parameter.id, log);
+}
+
 // 测试用例
 void test(int mode)
 {
@@ -41,8 +57,14 @@ void test(int mode)
 	kcp1->output = udp_output;
 	kcp2->output = udp_output;
 
-	IUINT32 current = iclock();
-	IUINT32 slap = current + 20;
+    kcp1->connected = udp_connect;
+    kcp2->connected = NULL;
+
+    kcp1->writelog = writelog;
+    kcp2->writelog = writelog;
+
+    kcp2->logmask = kcp1->logmask = 0; // 0xFFFFF;
+
 	IUINT32 index = 0;
 	IUINT32 next = 0;
 	IINT64 sumrtt = 0;
@@ -80,7 +102,14 @@ void test(int mode)
 	char buffer[2000];
 	int hr;
 
+    if (ikcp_connect(kcp1) != 0) {
+        printf("kcp connect failed");
+        return;
+    }
+
 	IUINT32 ts1 = iclock();
+    IUINT32 current = ts1;
+    IUINT32 slap    = current + 20;
 
 	while (1) {
 		isleep(1);
@@ -94,7 +123,10 @@ void test(int mode)
 			((IUINT32*)buffer)[1] = current;
 
 			// 发送上层协议包
-			ikcp_send(kcp1, buffer, 8);
+            if (ikcp_send(kcp1, buffer, 8) != 8) {
+                printf("ikcp send failed");
+                return;
+            }
 		}
 
 		// 处理虚拟网络：检测是否有udp包从p1->p2
